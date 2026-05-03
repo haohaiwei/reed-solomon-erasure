@@ -9,21 +9,16 @@
 //! the missing data.
 #![allow(dead_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
+#![deny(clippy::correctness)]
+#![warn(clippy::suspicious, clippy::style, clippy::complexity, clippy::perf)]
+#![warn(missing_docs)]
 
-#[cfg(test)]
-#[macro_use]
-extern crate quickcheck;
+extern crate alloc;
+extern crate core as std_core;
 
-#[cfg(test)]
-extern crate rand;
+use alloc::vec;
 
-extern crate smallvec;
-
-#[cfg(feature = "simd-accel")]
-extern crate libc;
-
-use ::core::iter;
-use ::core::iter::FromIterator;
+use std_core::iter::FromIterator;
 
 #[macro_use]
 mod macros;
@@ -34,6 +29,9 @@ mod matrix;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "std")]
+pub mod streaming;
 
 pub mod galois_16;
 pub mod galois_8;
@@ -59,7 +57,7 @@ pub trait Field: Sized {
     const ORDER: usize;
 
     /// The representational type of the field.
-    type Elem: Default + Clone + Copy + PartialEq + ::core::fmt::Debug;
+    type Elem: Default + Clone + Copy + PartialEq + ::core::fmt::Debug + Sync + Send;
 
     /// Add two elements together.
     fn add(a: Self::Elem, b: Self::Elem) -> Self::Elem;
@@ -100,7 +98,7 @@ pub trait Field: Sized {
         assert_eq!(input.len(), out.len());
 
         for (i, o) in input.iter().zip(out) {
-            *o = Self::mul(elem.clone(), i.clone())
+            *o = Self::mul(elem, *i)
         }
     }
 
@@ -113,9 +111,19 @@ pub trait Field: Sized {
         assert_eq!(input.len(), out.len());
 
         for (i, o) in input.iter().zip(out) {
-            *o = Self::add(o.clone(), Self::mul(elem.clone(), i.clone()))
+            *o = Self::add(*o, Self::mul(elem, *i))
         }
     }
+}
+
+/// Result of getting or initializing a shard for reconstruction.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum ShardInit<'a, F: Field> {
+    /// The shard already existed.
+    Existing(&'a mut [F::Elem]),
+    /// The shard was newly initialized (was missing).
+    Initialized(&'a mut [F::Elem]),
 }
 
 /// Something which might hold a shard.
@@ -130,11 +138,8 @@ pub trait ReconstructShard<F: Field> {
     fn get(&mut self) -> Option<&mut [F::Elem]>;
 
     /// Get a mutable reference to the shard data, initializing it to the
-    /// given length if it was `None`. Returns an error if initialization fails.
-    fn get_or_initialize(
-        &mut self,
-        len: usize,
-    ) -> Result<&mut [F::Elem], Result<&mut [F::Elem], Error>>;
+    /// given length if it was `None`.
+    fn get_or_initialize(&mut self, len: usize) -> Result<ShardInit<'_, F>, Error>;
 }
 
 impl<F: Field, T: AsRef<[F::Elem]> + AsMut<[F::Elem]> + FromIterator<F::Elem>> ReconstructShard<F>
@@ -151,16 +156,16 @@ impl<F: Field, T: AsRef<[F::Elem]> + AsMut<[F::Elem]> + FromIterator<F::Elem>> R
     fn get_or_initialize(
         &mut self,
         len: usize,
-    ) -> Result<&mut [F::Elem], Result<&mut [F::Elem], Error>> {
+    ) -> Result<ShardInit<'_, F>, Error> {
         let is_some = self.is_some();
         let x = self
-            .get_or_insert_with(|| iter::repeat(F::zero()).take(len).collect())
+            .get_or_insert_with(|| T::from_iter(std_core::iter::repeat_n(F::zero(), len)))
             .as_mut();
 
         if is_some {
-            Ok(x)
+            Ok(ShardInit::Existing(x))
         } else {
-            Err(Ok(x))
+            Ok(ShardInit::Initialized(x))
         }
     }
 }
@@ -185,16 +190,17 @@ impl<F: Field, T: AsRef<[F::Elem]> + AsMut<[F::Elem]>> ReconstructShard<F> for (
     fn get_or_initialize(
         &mut self,
         len: usize,
-    ) -> Result<&mut [F::Elem], Result<&mut [F::Elem], Error>> {
+    ) -> Result<ShardInit<'_, F>, Error> {
         let x = self.0.as_mut();
         if x.len() == len {
             if self.1 {
-                Ok(x)
+                Ok(ShardInit::Existing(x))
             } else {
-                Err(Ok(x))
+                self.1 = true;
+                Ok(ShardInit::Initialized(x))
             }
         } else {
-            Err(Err(Error::IncorrectShardSize))
+            Err(Error::IncorrectShardSize)
         }
     }
 }

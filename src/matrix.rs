@@ -12,7 +12,7 @@ pub enum Error {
     SingularMatrix,
 }
 
-macro_rules! acc {
+macro_rules! m_elem {
     (
         $m:ident, $r:expr, $c:expr
     ) => {
@@ -95,7 +95,7 @@ impl<F: Field> Matrix<F> {
     pub fn identity(size: usize) -> Matrix<F> {
         let mut result = Self::new(size, size);
         for i in 0..size {
-            acc!(result, i, i) = F::one();
+            m_elem!(result, i, i) = F::one();
         }
         result
     }
@@ -109,11 +109,11 @@ impl<F: Field> Matrix<F> {
     }
 
     pub fn get(&self, r: usize, c: usize) -> F::Elem {
-        acc!(self, r, c).clone()
+        m_elem!(self, r, c)
     }
 
     pub fn set(&mut self, r: usize, c: usize, val: F::Elem) {
-        acc!(self, r, c) = val;
+        m_elem!(self, r, c) = val;
     }
 
     pub fn multiply(&self, rhs: &Matrix<F>) -> Matrix<F> {
@@ -128,11 +128,11 @@ impl<F: Field> Matrix<F> {
             for c in 0..rhs.col_count {
                 let mut val = F::zero();
                 for i in 0..self.col_count {
-                    let mul = F::mul(acc!(self, r, i).clone(), acc!(rhs, i, c).clone());
+                    let mul = F::mul(m_elem!(self, r, i), m_elem!(rhs, i, c));
 
                     val = F::add(val, mul);
                 }
-                acc!(result, r, c) = val;
+                m_elem!(result, r, c) = val;
             }
         }
         result
@@ -148,11 +148,11 @@ impl<F: Field> Matrix<F> {
         let mut result = Self::new(self.row_count, self.col_count + rhs.col_count);
         for r in 0..self.row_count {
             for c in 0..self.col_count {
-                acc!(result, r, c) = acc!(self, r, c).clone();
+                m_elem!(result, r, c) = m_elem!(self, r, c);
             }
             let self_column_count = self.col_count;
             for c in 0..rhs.col_count {
-                acc!(result, r, self_column_count + c) = acc!(rhs, r, c).clone();
+                m_elem!(result, r, self_column_count + c) = m_elem!(rhs, r, c);
             }
         }
 
@@ -163,7 +163,7 @@ impl<F: Field> Matrix<F> {
         let mut result = Self::new(rmax - rmin, cmax - cmin);
         for r in rmin..rmax {
             for c in cmin..cmax {
-                acc!(result, r - rmin, c - cmin) = acc!(self, r, c).clone();
+                m_elem!(result, r - rmin, c - cmin) = m_elem!(self, r, c);
             }
         }
         result
@@ -180,7 +180,6 @@ impl<F: Field> Matrix<F> {
         let (r2_s, _) = self.calc_row_start_end(r2);
 
         if r1 == r2 {
-            return;
         } else {
             for i in 0..self.col_count {
                 self.data.swap(r1_s + i, r2_s + i);
@@ -194,35 +193,35 @@ impl<F: Field> Matrix<F> {
 
     pub fn gaussian_elim(&mut self) -> Result<(), Error> {
         for r in 0..self.row_count {
-            if acc!(self, r, r) == F::zero() {
+            if m_elem!(self, r, r) == F::zero() {
                 for r_below in r + 1..self.row_count {
-                    if acc!(self, r_below, r) != F::zero() {
+                    if m_elem!(self, r_below, r) != F::zero() {
                         self.swap_rows(r, r_below);
                         break;
                     }
                 }
             }
             // If we couldn't find one, the matrix is singular.
-            if acc!(self, r, r) == F::zero() {
+            if m_elem!(self, r, r) == F::zero() {
                 return Err(Error::SingularMatrix);
             }
             // Scale to 1.
-            if acc!(self, r, r) != F::one() {
-                let scale = F::div(F::one(), acc!(self, r, r).clone());
+            if m_elem!(self, r, r) != F::one() {
+                let scale = F::div(F::one(), m_elem!(self, r, r));
                 for c in 0..self.col_count {
-                    acc!(self, r, c) = F::mul(scale, acc!(self, r, c).clone());
+                    m_elem!(self, r, c) = F::mul(scale, m_elem!(self, r, c));
                 }
             }
             // Make everything below the 1 be a 0 by subtracting
             // a multiple of it.  (Subtraction and addition are
             // both exclusive or in the Galois field.)
             for r_below in r + 1..self.row_count {
-                if acc!(self, r_below, r) != F::zero() {
-                    let scale = acc!(self, r_below, r).clone();
+                if m_elem!(self, r_below, r) != F::zero() {
+                    let scale = m_elem!(self, r_below, r);
                     for c in 0..self.col_count {
-                        acc!(self, r_below, c) = F::add(
-                            acc!(self, r_below, c).clone(),
-                            F::mul(scale, acc!(self, r, c).clone()),
+                        m_elem!(self, r_below, c) = F::add(
+                            m_elem!(self, r_below, c),
+                            F::mul(scale, m_elem!(self, r, c)),
                         );
                     }
                 }
@@ -232,12 +231,12 @@ impl<F: Field> Matrix<F> {
         // Now clear the part above the main diagonal.
         for d in 0..self.row_count {
             for r_above in 0..d {
-                if acc!(self, r_above, d) != F::zero() {
-                    let scale = acc!(self, r_above, d).clone();
+                if m_elem!(self, r_above, d) != F::zero() {
+                    let scale = m_elem!(self, r_above, d);
                     for c in 0..self.col_count {
-                        acc!(self, r_above, c) = F::add(
-                            acc!(self, r_above, c).clone(),
-                            F::mul(scale, acc!(self, d, c).clone()),
+                        m_elem!(self, r_above, c) = F::add(
+                            m_elem!(self, r_above, c),
+                            F::mul(scale, m_elem!(self, d, c)),
                         );
                     }
                 }
@@ -268,7 +267,7 @@ impl<F: Field> Matrix<F> {
             // then the vandermonde matrix is invertible.
             let r_a = F::nth(r);
             for c in 0..cols {
-                acc!(result, r, c) = F::exp(r_a, c);
+                m_elem!(result, r, c) = F::exp(r_a, c);
             }
         }
 

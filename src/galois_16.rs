@@ -319,6 +319,7 @@ impl Element {
 mod tests {
     use super::*;
     use quickcheck::Arbitrary;
+    use quickcheck::quickcheck;
 
     impl Arbitrary for Element {
         fn arbitrary<G: quickcheck::Gen>(gen: &mut G) -> Self {

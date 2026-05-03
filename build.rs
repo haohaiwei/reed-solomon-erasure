@@ -1,10 +1,9 @@
+#![allow(clippy::needless_range_loop)]
 use std::env;
+use std::fmt::Write;
 use std::fs::File;
-use std::io::Write;
+use std::io::Write as IoWrite;
 use std::path::Path;
-
-#[cfg(feature = "simd-accel")]
-extern crate cc;
 
 const FIELD_SIZE: usize = 256;
 
@@ -17,7 +16,7 @@ fn gen_log_table(polynomial: usize) -> [u8; FIELD_SIZE] {
     for log in 0..FIELD_SIZE - 1 {
         result[b] = log as u8;
 
-        b = b << 1;
+        b <<= 1;
 
         if FIELD_SIZE <= b {
             b = (b - FIELD_SIZE) ^ polynomial;
@@ -96,37 +95,38 @@ fn gen_mul_table_half(
 macro_rules! write_table {
     (1D => $file:ident, $table:ident, $name:expr, $type:expr) => {{
         let len = $table.len();
-        let mut table_str = String::from(format!("pub static {}: [{}; {}] = [", $name, $type, len));
+        let mut table_str = String::with_capacity(len * 5 + 64);
+        write!(table_str, "pub static {}: [{}; {}] = [", $name, $type, len).unwrap();
 
         for v in $table.iter() {
-            let str = format!("{}, ", v);
-            table_str.push_str(&str);
+            write!(table_str, "{}, ", v).unwrap();
         }
 
         table_str.push_str("];\n");
 
-        $file.write_all(table_str.as_bytes()).unwrap();
+        $file.write_all(table_str.as_bytes()).expect("failed to write lookup table");
     }};
     (2D => $file:ident, $table:ident, $name:expr, $type:expr) => {{
         let rows = $table.len();
         let cols = $table[0].len();
-        let mut table_str = String::from(format!(
+        let mut table_str = String::with_capacity(rows * (cols * 5 + 8) + 64);
+        write!(
+            table_str,
             "pub static {}: [[{}; {}]; {}] = [",
             $name, $type, cols, rows
-        ));
+        ).unwrap();
 
         for a in $table.iter() {
-            table_str.push_str("[");
+            table_str.push('[');
             for b in a.iter() {
-                let str = format!("{}, ", b);
-                table_str.push_str(&str);
+                write!(table_str, "{}, ", b).unwrap();
             }
             table_str.push_str("],\n");
         }
 
         table_str.push_str("];\n");
 
-        $file.write_all(table_str.as_bytes()).unwrap();
+        $file.write_all(table_str.as_bytes()).expect("failed to write lookup table");
     }};
 }
 
@@ -135,62 +135,20 @@ fn write_tables() {
     let exp_table = gen_exp_table(&log_table);
     let mul_table = gen_mul_table(&log_table, &exp_table);
 
-    let out_dir = env::var("OUT_DIR").unwrap();
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set by build system");
     let dest_path = Path::new(&out_dir).join("table.rs");
-    let mut f = File::create(&dest_path).unwrap();
+    let mut f = File::create(&dest_path).expect("failed to create table.rs");
 
     write_table!(1D => f, log_table,      "LOG_TABLE",      "u8");
     write_table!(1D => f, exp_table,      "EXP_TABLE",      "u8");
     write_table!(2D => f, mul_table,      "MUL_TABLE",      "u8");
 
-    if cfg!(feature = "simd-accel") {
-        let (mul_table_low, mul_table_high) = gen_mul_table_half(&log_table, &exp_table);
+    let (mul_table_low, mul_table_high) = gen_mul_table_half(&log_table, &exp_table);
 
-        write_table!(2D => f, mul_table_low,  "MUL_TABLE_LOW",  "u8");
-        write_table!(2D => f, mul_table_high, "MUL_TABLE_HIGH", "u8");
-    }
+    write_table!(2D => f, mul_table_low,  "MUL_TABLE_LOW",  "u8");
+    write_table!(2D => f, mul_table_high, "MUL_TABLE_HIGH", "u8");
 }
-
-#[cfg(all(
-    feature = "simd-accel",
-    any(target_arch = "x86_64", target_arch = "aarch64"),
-    not(target_env = "msvc"),
-    not(any(target_os = "android", target_os = "ios"))
-))]
-fn compile_simd_c() {
-    let mut build = cc::Build::new();
-    build.opt_level(3);
-
-    match env::var("RUST_REED_SOLOMON_ERASURE_ARCH") {
-        Ok(arch) => {
-            // Use explicitly specified environment variable as architecture.
-            build.flag(&format!("-march={}", arch));
-        }
-        Err(_error) => {
-            // On x86-64 enabling Haswell architecture unlocks useful instructions and improves performance
-            // dramatically while allowing it to run ony modern CPU.
-            match env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str(){
-                "x86_64"  => { build.flag(&"-march=haswell"); },
-                _         => ()
-            }
-        }
-    }
-
-    build
-        .flag("-std=c11")
-        .file("simd_c/reedsolomon.c")
-        .compile("reedsolomon");
-}
-
-#[cfg(not(all(
-    feature = "simd-accel",
-    any(target_arch = "x86_64", target_arch = "aarch64"),
-    not(target_env = "msvc"),
-    not(any(target_os = "android", target_os = "ios"))
-)))]
-fn compile_simd_c() {}
 
 fn main() {
-    compile_simd_c();
     write_tables();
 }

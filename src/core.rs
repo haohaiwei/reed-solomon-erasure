@@ -114,7 +114,7 @@ impl<'a, F: 'a + Field> ShardByShard<'a, F> {
     }
 
     /// Checks if the parity shards are ready to use.
-    pub fn parity_ready(&self) -> bool {
+    pub fn is_parity_ready(&self) -> bool {
         self.cur_input == self.codec.data_shard_count
     }
 
@@ -126,7 +126,7 @@ impl<'a, F: 'a + Field> ShardByShard<'a, F> {
     /// Returns `SBSError::LeftoverShards` when there are shards encoded
     /// but parity shards are not ready to use.
     pub fn reset(&mut self) -> Result<(), SBSError> {
-        if self.cur_input > 0 && !self.parity_ready() {
+        if self.cur_input > 0 && !self.is_parity_ready() {
             return Err(SBSError::LeftoverShards);
         }
 
@@ -141,7 +141,7 @@ impl<'a, F: 'a + Field> ShardByShard<'a, F> {
     }
 
     /// Returns the current input shard index.
-    pub fn cur_input_index(&self) -> usize {
+    pub fn cur_input(&self) -> usize {
         self.cur_input
     }
 
@@ -161,7 +161,7 @@ impl<'a, F: 'a + Field> ShardByShard<'a, F> {
             Ok(())
         };
 
-        if self.parity_ready() {
+        if self.is_parity_ready() {
             return Err(SBSError::TooManyCalls);
         }
 
@@ -184,7 +184,7 @@ impl<'a, F: 'a + Field> ShardByShard<'a, F> {
             Ok(())
         };
 
-        if self.parity_ready() {
+        if self.is_parity_ready() {
             return Err(SBSError::TooManyCalls);
         }
 
@@ -206,7 +206,7 @@ impl<'a, F: 'a + Field> ShardByShard<'a, F> {
         let shards = shards.as_mut();
         self.sbs_encode_checks(shards)?;
 
-        self.codec.encode_single(self.cur_input, shards).unwrap();
+        self.codec.encode_single(self.cur_input, shards).expect("sbs_encode_checks already verified all preconditions");
 
         self.return_ok_and_incre_cur_input()
     }
@@ -224,7 +224,7 @@ impl<'a, F: 'a + Field> ShardByShard<'a, F> {
 
         self.codec
             .encode_single_sep(self.cur_input, data[self.cur_input].as_ref(), parity)
-            .unwrap();
+            .expect("sbs_encode_sep_checks already verified all preconditions");
 
         self.return_ok_and_incre_cur_input()
     }
@@ -432,7 +432,7 @@ impl<F: Field> ReedSolomon<F> {
 
         let top = vandermonde.sub_matrix(0, 0, data_shards, data_shards);
 
-        vandermonde.multiply(&top.invert().unwrap())
+        vandermonde.multiply(&top.invert().expect("Vandermonde top-left submatrix is mathematically guaranteed to be invertible"))
     }
 
     /// Creates a new instance of Reed-Solomon erasure code encoder/decoder.
@@ -462,7 +462,10 @@ impl<F: Field> ReedSolomon<F> {
             parity_shard_count: parity_shards,
             total_shard_count: total_shards,
             matrix,
-            data_decode_matrix_cache: Mutex::new(LruCache::new(DATA_DECODE_MATRIX_CACHE_CAPACITY)),
+            data_decode_matrix_cache: Mutex::new(LruCache::new(
+                core::num::NonZeroUsize::new(DATA_DECODE_MATRIX_CACHE_CAPACITY)
+                    .expect("DATA_DECODE_MATRIX_CACHE_CAPACITY > 0"),
+            )),
         })
     }
 
@@ -484,8 +487,17 @@ impl<F: Field> ReedSolomon<F> {
         inputs: &[T],
         outputs: &mut [U],
     ) {
-        for i_input in 0..self.data_shard_count {
-            self.code_single_slice(matrix_rows, i_input, inputs[i_input].as_ref(), outputs);
+        for i_row in 0..outputs.len() {
+            let row = matrix_rows[i_row];
+            let output = outputs[i_row].as_mut();
+            for i_input in 0..inputs.len() {
+                let coefficient = row[i_input];
+                if i_input == 0 {
+                    F::mul_slice(coefficient, inputs[i_input].as_ref(), output);
+                } else {
+                    F::mul_slice_add(coefficient, inputs[i_input].as_ref(), output);
+                }
+            }
         }
     }
 
@@ -719,7 +731,7 @@ impl<F: Field> ReedSolomon<F> {
         // we want to decode. Note that since this matrix maps back to the
         // original data, it can be used to create a data shard, but not a
         // parity shard.
-        let data_decode_matrix = Arc::new(sub_matrix.invert().unwrap());
+        let data_decode_matrix = Arc::new(sub_matrix.invert().expect("sub_matrix is constructed from valid rows, thus mathematically guaranteed to be invertible"));
         // Cache the inverted matrix for future use keyed on the indices of the
         // invalid rows.
         {
@@ -803,39 +815,33 @@ impl<F: Field> ReedSolomon<F> {
             // but if we are only reconstructing data shard,
             // do not initialize if the shard is not a data shard
             let shard_data = if matrix_row >= data_shard_count && data_only {
-                shard.get().ok_or(None)
+                shard.get().map(super::ShardInit::Existing).ok_or(None)
             } else {
                 shard.get_or_initialize(shard_len).map_err(Some)
             };
 
             match shard_data {
-                Ok(shard) => {
+                Ok(super::ShardInit::Existing(shard)) => {
                     if sub_shards.len() < data_shard_count {
                         sub_shards.push(shard);
                         valid_indices.push(matrix_row);
-                    } else {
-                        // Already have enough shards in `sub_shards`
-                        // as we only need N shards, where N = `data_shard_count`,
-                        // for the data decode matrix
-                        //
-                        // So nothing to do here
                     }
+                }
+                Ok(super::ShardInit::Initialized(shard)) => {
+                    if matrix_row < data_shard_count {
+                        missing_data_slices.push(shard);
+                    } else {
+                        missing_parity_slices.push(shard);
+                    }
+                    invalid_indices.push(matrix_row);
                 }
                 Err(None) => {
                     // the shard data is not meant to be initialized here,
                     // but we should still note it missing.
                     invalid_indices.push(matrix_row);
                 }
-                Err(Some(x)) => {
-                    // initialized missing shard data.
-                    let shard = x?;
-                    if matrix_row < data_shard_count {
-                        missing_data_slices.push(shard);
-                    } else {
-                        missing_parity_slices.push(shard);
-                    }
-
-                    invalid_indices.push(matrix_row);
+                Err(Some(e)) => {
+                    return Err(e);
                 }
             }
         }

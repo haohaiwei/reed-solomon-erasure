@@ -53,23 +53,31 @@ pub type ReedSolomon = crate::ReedSolomon<Field>;
 /// Type alias of ShardByShard over GF(2^8).
 pub type ShardByShard<'a> = crate::ShardByShard<'a, Field>;
 
+/// Type alias of StreamEncoder over GF(2^8).
+#[cfg(feature = "std")]
+pub type StreamEncoder = crate::streaming::StreamEncoder<Field>;
+
 /// Add two elements.
+#[inline]
 pub fn add(a: u8, b: u8) -> u8 {
     a ^ b
 }
 
 /// Subtract `b` from `a`.
 #[cfg(test)]
+#[inline]
 pub fn sub(a: u8, b: u8) -> u8 {
     a ^ b
 }
 
 /// Multiply two elements.
+#[inline]
 pub fn mul(a: u8, b: u8) -> u8 {
     MUL_TABLE[a as usize][b as usize]
 }
 
 /// Divide one element by another. `b`, the divisor, may not be 0.
+#[inline]
 pub fn div(a: u8, b: u8) -> u8 {
     if a == 0 {
         0
@@ -87,6 +95,7 @@ pub fn div(a: u8, b: u8) -> u8 {
 }
 
 /// Compute a^n.
+#[inline]
 pub fn exp(a: u8, n: usize) -> u8 {
     if n == 0 {
         1
@@ -114,26 +123,7 @@ macro_rules! return_if_empty {
     };
 }
 
-#[cfg(not(all(
-    feature = "simd-accel",
-    any(target_arch = "x86_64", target_arch = "aarch64"),
-    not(target_env = "msvc"),
-    not(any(target_os = "android", target_os = "ios"))
-)))]
-pub fn mul_slice(c: u8, input: &[u8], out: &mut [u8]) {
-    mul_slice_pure_rust(c, input, out);
-}
-
-#[cfg(not(all(
-    feature = "simd-accel",
-    any(target_arch = "x86_64", target_arch = "aarch64"),
-    not(target_env = "msvc"),
-    not(any(target_os = "android", target_os = "ios"))
-)))]
-pub fn mul_slice_xor(c: u8, input: &[u8], out: &mut [u8]) {
-    mul_slice_xor_pure_rust(c, input, out);
-}
-
+#[inline]
 fn mul_slice_pure_rust(c: u8, input: &[u8], out: &mut [u8]) {
     let mt = &MUL_TABLE[c as usize];
     let mt_ptr: *const u8 = &mt[0];
@@ -176,6 +166,7 @@ fn mul_slice_pure_rust(c: u8, input: &[u8], out: &mut [u8]) {
      */
 }
 
+#[inline]
 fn mul_slice_xor_pure_rust(c: u8, input: &[u8], out: &mut [u8]) {
     let mt = &MUL_TABLE[c as usize];
     let mt_ptr: *const u8 = &mt[0];
@@ -258,72 +249,306 @@ fn slice_xor(input: &[u8], out: &mut [u8]) {
      */
 }
 
-#[cfg(all(
-    feature = "simd-accel",
-    any(target_arch = "x86_64", target_arch = "aarch64"),
-    not(target_env = "msvc"),
-    not(any(target_os = "android", target_os = "ios"))
-))]
-extern "C" {
-    fn reedsolomon_gal_mul(
-        low: *const u8,
-        high: *const u8,
-        input: *const u8,
-        out: *mut u8,
-        len: libc::size_t,
-    ) -> libc::size_t;
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+mod simd_x86 {
+    use super::{mul_slice_pure_rust, mul_slice_xor_pure_rust, MUL_TABLE_HIGH, MUL_TABLE_LOW};
 
-    fn reedsolomon_gal_mul_xor(
-        low: *const u8,
-        high: *const u8,
-        input: *const u8,
-        out: *mut u8,
-        len: libc::size_t,
-    ) -> libc::size_t;
+    macro_rules! gf_mul_body {
+        ($low:expr, $high:expr, $mask:expr, $in_vec:expr) => {{
+            let lo = _mm_and_si128($in_vec, $mask);
+            let hi = _mm_and_si128(_mm_srli_epi64($in_vec, 4), $mask);
+            let mul_lo = _mm_shuffle_epi8($low, lo);
+            let mul_hi = _mm_shuffle_epi8($high, hi);
+            _mm_xor_si128(mul_lo, mul_hi)
+        }};
+    }
+
+    macro_rules! gf_mul_body_256 {
+        ($low:expr, $high:expr, $mask:expr, $in_vec:expr) => {{
+            let lo = _mm256_and_si256($in_vec, $mask);
+            let hi = _mm256_and_si256(_mm256_srli_epi64($in_vec, 4), $mask);
+            let mul_lo = _mm256_shuffle_epi8($low, lo);
+            let mul_hi = _mm256_shuffle_epi8($high, hi);
+            _mm256_xor_si256(mul_lo, mul_hi)
+        }};
+    }
+
+    macro_rules! gf_mul_body_512 {
+        ($low:expr, $high:expr, $mask:expr, $in_vec:expr) => {{
+            let lo = _mm512_and_si512($in_vec, $mask);
+            let hi = _mm512_and_si512(_mm512_srli_epi64($in_vec, 4), $mask);
+            let mul_lo = _mm512_shuffle_epi8($low, lo);
+            let mul_hi = _mm512_shuffle_epi8($high, hi);
+            _mm512_xor_si512(mul_lo, mul_hi)
+        }};
+    }
+
+    #[target_feature(enable = "ssse3")]
+    unsafe fn mul_slice_ssse3(c: u8, input: &[u8], out: &mut [u8]) {
+        use core::arch::x86_64::*;
+
+        let low = _mm_loadu_si128(MUL_TABLE_LOW[c as usize].as_ptr() as *const __m128i);
+        let high = _mm_loadu_si128(MUL_TABLE_HIGH[c as usize].as_ptr() as *const __m128i);
+        let mask = _mm_set1_epi8(0x0f_i8);
+
+        let mut i = 0;
+        let len = input.len();
+        while i + 64 <= len {
+            let r0 = gf_mul_body!(low, high, mask, _mm_loadu_si128(input.as_ptr().add(i) as *const __m128i));
+            let r1 = gf_mul_body!(low, high, mask, _mm_loadu_si128(input.as_ptr().add(i + 16) as *const __m128i));
+            let r2 = gf_mul_body!(low, high, mask, _mm_loadu_si128(input.as_ptr().add(i + 32) as *const __m128i));
+            let r3 = gf_mul_body!(low, high, mask, _mm_loadu_si128(input.as_ptr().add(i + 48) as *const __m128i));
+            _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, r0);
+            _mm_storeu_si128(out.as_mut_ptr().add(i + 16) as *mut __m128i, r1);
+            _mm_storeu_si128(out.as_mut_ptr().add(i + 32) as *mut __m128i, r2);
+            _mm_storeu_si128(out.as_mut_ptr().add(i + 48) as *mut __m128i, r3);
+            i += 64;
+        }
+        while i + 16 <= len {
+            let in_vec = _mm_loadu_si128(input.as_ptr().add(i) as *const __m128i);
+            let result = gf_mul_body!(low, high, mask, in_vec);
+            _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, result);
+            i += 16;
+        }
+
+        mul_slice_pure_rust(c, &input[i..], &mut out[i..]);
+    }
+
+    #[target_feature(enable = "ssse3")]
+    unsafe fn mul_slice_xor_ssse3(c: u8, input: &[u8], out: &mut [u8]) {
+        use core::arch::x86_64::*;
+
+        let low = _mm_loadu_si128(MUL_TABLE_LOW[c as usize].as_ptr() as *const __m128i);
+        let high = _mm_loadu_si128(MUL_TABLE_HIGH[c as usize].as_ptr() as *const __m128i);
+        let mask = _mm_set1_epi8(0x0f_i8);
+
+        let mut i = 0;
+        let len = input.len();
+        while i + 64 <= len {
+            let r0 = _mm_xor_si128(gf_mul_body!(low, high, mask, _mm_loadu_si128(input.as_ptr().add(i) as *const __m128i)), _mm_loadu_si128(out.as_ptr().add(i) as *const __m128i));
+            let r1 = _mm_xor_si128(gf_mul_body!(low, high, mask, _mm_loadu_si128(input.as_ptr().add(i + 16) as *const __m128i)), _mm_loadu_si128(out.as_ptr().add(i + 16) as *const __m128i));
+            let r2 = _mm_xor_si128(gf_mul_body!(low, high, mask, _mm_loadu_si128(input.as_ptr().add(i + 32) as *const __m128i)), _mm_loadu_si128(out.as_ptr().add(i + 32) as *const __m128i));
+            let r3 = _mm_xor_si128(gf_mul_body!(low, high, mask, _mm_loadu_si128(input.as_ptr().add(i + 48) as *const __m128i)), _mm_loadu_si128(out.as_ptr().add(i + 48) as *const __m128i));
+            _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, r0);
+            _mm_storeu_si128(out.as_mut_ptr().add(i + 16) as *mut __m128i, r1);
+            _mm_storeu_si128(out.as_mut_ptr().add(i + 32) as *mut __m128i, r2);
+            _mm_storeu_si128(out.as_mut_ptr().add(i + 48) as *mut __m128i, r3);
+            i += 64;
+        }
+        while i + 16 <= len {
+            let in_vec = _mm_loadu_si128(input.as_ptr().add(i) as *const __m128i);
+            let out_vec = _mm_loadu_si128(out.as_ptr().add(i) as *const __m128i);
+            let result = _mm_xor_si128(gf_mul_body!(low, high, mask, in_vec), out_vec);
+            _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, result);
+            i += 16;
+        }
+
+        mul_slice_xor_pure_rust(c, &input[i..], &mut out[i..]);
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn mul_slice_avx2(c: u8, input: &[u8], out: &mut [u8]) {
+        use core::arch::x86_64::*;
+
+        let low_128 = _mm_loadu_si128(MUL_TABLE_LOW[c as usize].as_ptr() as *const __m128i);
+        let high_128 = _mm_loadu_si128(MUL_TABLE_HIGH[c as usize].as_ptr() as *const __m128i);
+        let low = _mm256_broadcastsi128_si256(low_128);
+        let high = _mm256_broadcastsi128_si256(high_128);
+        let mask = _mm256_set1_epi8(0x0f_i8);
+
+        let mut i = 0;
+        let len = input.len();
+        while i + 128 <= len {
+            let r0 = gf_mul_body_256!(low, high, mask, _mm256_loadu_si256(input.as_ptr().add(i) as *const __m256i));
+            let r1 = gf_mul_body_256!(low, high, mask, _mm256_loadu_si256(input.as_ptr().add(i + 32) as *const __m256i));
+            let r2 = gf_mul_body_256!(low, high, mask, _mm256_loadu_si256(input.as_ptr().add(i + 64) as *const __m256i));
+            let r3 = gf_mul_body_256!(low, high, mask, _mm256_loadu_si256(input.as_ptr().add(i + 96) as *const __m256i));
+            _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, r0);
+            _mm256_storeu_si256(out.as_mut_ptr().add(i + 32) as *mut __m256i, r1);
+            _mm256_storeu_si256(out.as_mut_ptr().add(i + 64) as *mut __m256i, r2);
+            _mm256_storeu_si256(out.as_mut_ptr().add(i + 96) as *mut __m256i, r3);
+            i += 128;
+        }
+        while i + 32 <= len {
+            let in_vec = _mm256_loadu_si256(input.as_ptr().add(i) as *const __m256i);
+            let result = gf_mul_body_256!(low, high, mask, in_vec);
+            _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, result);
+            i += 32;
+        }
+
+        if i + 16 <= len {
+            mul_slice_ssse3(c, &input[i..], &mut out[i..]);
+        } else {
+            mul_slice_pure_rust(c, &input[i..], &mut out[i..]);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn mul_slice_xor_avx2(c: u8, input: &[u8], out: &mut [u8]) {
+        use core::arch::x86_64::*;
+
+        let low_128 = _mm_loadu_si128(MUL_TABLE_LOW[c as usize].as_ptr() as *const __m128i);
+        let high_128 = _mm_loadu_si128(MUL_TABLE_HIGH[c as usize].as_ptr() as *const __m128i);
+        let low = _mm256_broadcastsi128_si256(low_128);
+        let high = _mm256_broadcastsi128_si256(high_128);
+        let mask = _mm256_set1_epi8(0x0f_i8);
+
+        let mut i = 0;
+        let len = input.len();
+        while i + 128 <= len {
+            let r0 = _mm256_xor_si256(gf_mul_body_256!(low, high, mask, _mm256_loadu_si256(input.as_ptr().add(i) as *const __m256i)), _mm256_loadu_si256(out.as_ptr().add(i) as *const __m256i));
+            let r1 = _mm256_xor_si256(gf_mul_body_256!(low, high, mask, _mm256_loadu_si256(input.as_ptr().add(i + 32) as *const __m256i)), _mm256_loadu_si256(out.as_ptr().add(i + 32) as *const __m256i));
+            let r2 = _mm256_xor_si256(gf_mul_body_256!(low, high, mask, _mm256_loadu_si256(input.as_ptr().add(i + 64) as *const __m256i)), _mm256_loadu_si256(out.as_ptr().add(i + 64) as *const __m256i));
+            let r3 = _mm256_xor_si256(gf_mul_body_256!(low, high, mask, _mm256_loadu_si256(input.as_ptr().add(i + 96) as *const __m256i)), _mm256_loadu_si256(out.as_ptr().add(i + 96) as *const __m256i));
+            _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, r0);
+            _mm256_storeu_si256(out.as_mut_ptr().add(i + 32) as *mut __m256i, r1);
+            _mm256_storeu_si256(out.as_mut_ptr().add(i + 64) as *mut __m256i, r2);
+            _mm256_storeu_si256(out.as_mut_ptr().add(i + 96) as *mut __m256i, r3);
+            i += 128;
+        }
+        while i + 32 <= len {
+            let in_vec = _mm256_loadu_si256(input.as_ptr().add(i) as *const __m256i);
+            let out_vec = _mm256_loadu_si256(out.as_ptr().add(i) as *const __m256i);
+            let result = _mm256_xor_si256(gf_mul_body_256!(low, high, mask, in_vec), out_vec);
+            _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, result);
+            i += 32;
+        }
+
+        if i + 16 <= len {
+            mul_slice_xor_ssse3(c, &input[i..], &mut out[i..]);
+        } else {
+            mul_slice_xor_pure_rust(c, &input[i..], &mut out[i..]);
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn mul_slice_avx512(c: u8, input: &[u8], out: &mut [u8]) {
+        use core::arch::x86_64::*;
+
+        let low_128 = _mm_loadu_si128(MUL_TABLE_LOW[c as usize].as_ptr() as *const __m128i);
+        let high_128 = _mm_loadu_si128(MUL_TABLE_HIGH[c as usize].as_ptr() as *const __m128i);
+        let low = _mm512_broadcast_i32x4(low_128);
+        let high = _mm512_broadcast_i32x4(high_128);
+        let mask = _mm512_set1_epi8(0x0f_i8);
+
+        let mut i = 0;
+        let len = input.len();
+        while i + 256 <= len {
+            let r0 = gf_mul_body_512!(low, high, mask, _mm512_loadu_si512(input.as_ptr().add(i) as *const __m512i));
+            let r1 = gf_mul_body_512!(low, high, mask, _mm512_loadu_si512(input.as_ptr().add(i + 64) as *const __m512i));
+            let r2 = gf_mul_body_512!(low, high, mask, _mm512_loadu_si512(input.as_ptr().add(i + 128) as *const __m512i));
+            let r3 = gf_mul_body_512!(low, high, mask, _mm512_loadu_si512(input.as_ptr().add(i + 192) as *const __m512i));
+            _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, r0);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i + 64) as *mut __m512i, r1);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i + 128) as *mut __m512i, r2);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i + 192) as *mut __m512i, r3);
+            i += 256;
+        }
+        while i + 64 <= len {
+            let in_vec = _mm512_loadu_si512(input.as_ptr().add(i) as *const __m512i);
+            let result = gf_mul_body_512!(low, high, mask, in_vec);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, result);
+            i += 64;
+        }
+
+        if i + 32 <= len {
+            mul_slice_avx2(c, &input[i..], &mut out[i..]);
+        } else if i + 16 <= len {
+            mul_slice_ssse3(c, &input[i..], &mut out[i..]);
+        } else {
+            mul_slice_pure_rust(c, &input[i..], &mut out[i..]);
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn mul_slice_xor_avx512(c: u8, input: &[u8], out: &mut [u8]) {
+        use core::arch::x86_64::*;
+
+        let low_128 = _mm_loadu_si128(MUL_TABLE_LOW[c as usize].as_ptr() as *const __m128i);
+        let high_128 = _mm_loadu_si128(MUL_TABLE_HIGH[c as usize].as_ptr() as *const __m128i);
+        let low = _mm512_broadcast_i32x4(low_128);
+        let high = _mm512_broadcast_i32x4(high_128);
+        let mask = _mm512_set1_epi8(0x0f_i8);
+
+        let mut i = 0;
+        let len = input.len();
+        while i + 256 <= len {
+            let r0 = _mm512_xor_si512(gf_mul_body_512!(low, high, mask, _mm512_loadu_si512(input.as_ptr().add(i) as *const __m512i)), _mm512_loadu_si512(out.as_ptr().add(i) as *const __m512i));
+            let r1 = _mm512_xor_si512(gf_mul_body_512!(low, high, mask, _mm512_loadu_si512(input.as_ptr().add(i + 64) as *const __m512i)), _mm512_loadu_si512(out.as_ptr().add(i + 64) as *const __m512i));
+            let r2 = _mm512_xor_si512(gf_mul_body_512!(low, high, mask, _mm512_loadu_si512(input.as_ptr().add(i + 128) as *const __m512i)), _mm512_loadu_si512(out.as_ptr().add(i + 128) as *const __m512i));
+            let r3 = _mm512_xor_si512(gf_mul_body_512!(low, high, mask, _mm512_loadu_si512(input.as_ptr().add(i + 192) as *const __m512i)), _mm512_loadu_si512(out.as_ptr().add(i + 192) as *const __m512i));
+            _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, r0);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i + 64) as *mut __m512i, r1);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i + 128) as *mut __m512i, r2);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i + 192) as *mut __m512i, r3);
+            i += 256;
+        }
+        while i + 64 <= len {
+            let in_vec = _mm512_loadu_si512(input.as_ptr().add(i) as *const __m512i);
+            let out_vec = _mm512_loadu_si512(out.as_ptr().add(i) as *const __m512i);
+            let result = _mm512_xor_si512(gf_mul_body_512!(low, high, mask, in_vec), out_vec);
+            _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, result);
+            i += 64;
+        }
+
+        if i + 32 <= len {
+            mul_slice_xor_avx2(c, &input[i..], &mut out[i..]);
+        } else if i + 16 <= len {
+            mul_slice_xor_ssse3(c, &input[i..], &mut out[i..]);
+        } else {
+            mul_slice_xor_pure_rust(c, &input[i..], &mut out[i..]);
+        }
+    }
+
+    pub fn mul_slice_dispatch(c: u8, input: &[u8], out: &mut [u8]) {
+        if is_x86_feature_detected!("avx512f") {
+            unsafe { mul_slice_avx512(c, input, out) }
+        } else if is_x86_feature_detected!("avx2") {
+            unsafe { mul_slice_avx2(c, input, out) }
+        } else if is_x86_feature_detected!("ssse3") {
+            unsafe { mul_slice_ssse3(c, input, out) }
+        } else {
+            mul_slice_pure_rust(c, input, out)
+        }
+    }
+
+    pub fn mul_slice_xor_dispatch(c: u8, input: &[u8], out: &mut [u8]) {
+        if is_x86_feature_detected!("avx512f") {
+            unsafe { mul_slice_xor_avx512(c, input, out) }
+        } else if is_x86_feature_detected!("avx2") {
+            unsafe { mul_slice_xor_avx2(c, input, out) }
+        } else if is_x86_feature_detected!("ssse3") {
+            unsafe { mul_slice_xor_ssse3(c, input, out) }
+        } else {
+            mul_slice_xor_pure_rust(c, input, out)
+        }
+    }
 }
 
-#[cfg(all(
-    feature = "simd-accel",
-    any(target_arch = "x86_64", target_arch = "aarch64"),
-    not(target_env = "msvc"),
-    not(any(target_os = "android", target_os = "ios"))
-))]
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[inline]
 pub fn mul_slice(c: u8, input: &[u8], out: &mut [u8]) {
-    let low: *const u8 = &MUL_TABLE_LOW[c as usize][0];
-    let high: *const u8 = &MUL_TABLE_HIGH[c as usize][0];
-
     assert_eq!(input.len(), out.len());
-
-    let input_ptr: *const u8 = &input[0];
-    let out_ptr: *mut u8 = &mut out[0];
-    let size: libc::size_t = input.len();
-
-    let bytes_done: usize =
-        unsafe { reedsolomon_gal_mul(low, high, input_ptr, out_ptr, size) as usize };
-
-    mul_slice_pure_rust(c, &input[bytes_done..], &mut out[bytes_done..]);
+    simd_x86::mul_slice_dispatch(c, input, out);
 }
 
-#[cfg(all(
-    feature = "simd-accel",
-    any(target_arch = "x86_64", target_arch = "aarch64"),
-    not(target_env = "msvc"),
-    not(any(target_os = "android", target_os = "ios"))
-))]
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
+#[inline]
 pub fn mul_slice_xor(c: u8, input: &[u8], out: &mut [u8]) {
-    let low: *const u8 = &MUL_TABLE_LOW[c as usize][0];
-    let high: *const u8 = &MUL_TABLE_HIGH[c as usize][0];
-
     assert_eq!(input.len(), out.len());
+    simd_x86::mul_slice_xor_dispatch(c, input, out);
+}
 
-    let input_ptr: *const u8 = &input[0];
-    let out_ptr: *mut u8 = &mut out[0];
-    let size: libc::size_t = input.len();
+#[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+#[inline]
+pub fn mul_slice(c: u8, input: &[u8], out: &mut [u8]) {
+    mul_slice_pure_rust(c, input, out);
+}
 
-    let bytes_done: usize =
-        unsafe { reedsolomon_gal_mul_xor(low, high, input_ptr, out_ptr, size) as usize };
-
-    mul_slice_xor_pure_rust(c, &input[bytes_done..], &mut out[bytes_done..]);
+#[cfg(not(all(target_arch = "x86_64", feature = "std")))]
+#[inline]
+pub fn mul_slice_xor(c: u8, input: &[u8], out: &mut [u8]) {
+    mul_slice_xor_pure_rust(c, input, out);
 }
 
 #[cfg(test)]
@@ -331,6 +556,7 @@ mod tests {
     extern crate alloc;
 
     use alloc::vec;
+    use quickcheck::quickcheck;
 
     use super::*;
     use crate::tests::fill_random;
@@ -615,6 +841,58 @@ mod tests {
                 mul_slice_xor(c, &input, &mut output_copy);
 
                 assert_eq!(output, output_copy);
+            }
+        }
+    }
+
+    /// Exhaustive test: verify mul_slice matches MUL_TABLE for all 256 coefficients
+    /// and various buffer lengths (including SIMD boundary cases).
+    #[test]
+    fn test_simd_mul_slice_exhaustive() {
+        let lengths = [0, 1, 15, 16, 17, 31, 32, 33, 64, 100];
+
+        for &len in &lengths {
+            let input: vec::Vec<u8> = (0..=255u8).cycle().take(len).collect();
+
+            for c in 0u16..256 {
+                let c = c as u8;
+                let mut simd_out = vec![0u8; len];
+                let mut table_out = vec![0u8; len];
+
+                mul_slice(c, &input, &mut simd_out);
+
+                for i in 0..len {
+                    table_out[i] = MUL_TABLE[c as usize][input[i] as usize];
+                }
+
+                assert_eq!(simd_out, table_out,
+                    "mul_slice mismatch: c={}, len={}", c, len);
+            }
+        }
+    }
+
+    /// Exhaustive test: verify mul_slice_xor matches MUL_TABLE + XOR for all coefficients.
+    #[test]
+    fn test_simd_mul_slice_xor_exhaustive() {
+        let lengths = [0, 1, 15, 16, 17, 31, 32, 33, 64, 100];
+
+        for &len in &lengths {
+            let input: vec::Vec<u8> = (0..=255u8).cycle().take(len).collect();
+            let existing: vec::Vec<u8> = (200..=255u8).cycle().take(len).collect();
+
+            for c in 0u16..256 {
+                let c = c as u8;
+                let mut simd_out = existing.clone();
+                let mut table_out = existing.clone();
+
+                mul_slice_xor(c, &input, &mut simd_out);
+
+                for i in 0..len {
+                    table_out[i] ^= MUL_TABLE[c as usize][input[i] as usize];
+                }
+
+                assert_eq!(simd_out, table_out,
+                    "mul_slice_xor mismatch: c={}, len={}", c, len);
             }
         }
     }
